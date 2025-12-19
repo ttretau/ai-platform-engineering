@@ -23,6 +23,7 @@ Supported resource types:
 - ec2:vpc - VPCs
 - ec2:subnet - Subnets
 - ec2:security-group - Security Groups
+- ec2:transit-gateway-attachment - Transit Gateway Attachments
 - eks:cluster - EKS Clusters
 - s3:bucket - S3 Buckets
 - elasticloadbalancing:loadbalancer - Load Balancers (ALB/NLB/CLB)
@@ -37,7 +38,7 @@ logging.basicConfig(level=LOG_LEVEL)
 
 # Configuration
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", 86400))  # sync every day by default
-default_resource_types = 'iam:user,ec2:instance,ec2:volume,ec2:natgateway,ec2:vpc,ec2:subnet,ec2:security-group,eks:cluster,s3:bucket,elasticloadbalancing:loadbalancer,route53:hostedzone,rds:db,lambda:function,dynamodb:table'
+default_resource_types = 'iam:user,ec2:instance,ec2:volume,ec2:natgateway,ec2:vpc,ec2:subnet,ec2:security-group,eks:cluster,s3:bucket,elasticloadbalancing:loadbalancer,route53:hostedzone,rds:db,lambda:function,dynamodb:table,ec2:transit-gateway-attachment'
 RESOURCE_TYPES = os.environ.get('RESOURCE_TYPES', default_resource_types).split(',')
 # AWS Region - check both AWS_REGION and AWS_DEFAULT_REGION (boto3 default)
 AWS_REGION = os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or 'us-east-2'
@@ -110,6 +111,21 @@ RESOURCE_CONFIG = {
         'additional_keys': [['GroupId'], ['GroupName']],
         'regional': True
     },
+    'ec2:transit-gateway-attachment': {
+        'fetch_fn': 'get_transit_gateway_attachment_details',
+        'primary_key': ['Arn'],
+        'additional_keys': [
+            ['TransitGatewayAttachmentId'],
+            ['TransitGatewayId'],
+            ['TransitGatewayOwnerId'],
+            ['ResourceType'],
+            ['ResourceId'],
+            ['State']
+        ],
+        'regional': True,
+        'fetch_all_if_untagged': True,
+        'fetch_all_fn': 'fetch_all_transit_gateway_attachments'
+    },
     'rds:db': {
         'fetch_fn': 'get_rds_details',
         'primary_key': ['DBInstanceArn'],
@@ -175,6 +191,41 @@ async def fetch_resources(resource_type: str, region: str) -> List[str]:
             resource_arns.append(resource['ResourceARN'])
 
     return resource_arns
+
+
+async def fetch_all_transit_gateway_attachments(region: str, account_id: str) -> List[str]:
+    """
+    Fetch all Transit Gateway Attachments in a region, even if untagged.
+    This is needed because Transit Gateway Attachments are often untagged and won't appear
+    in the Resource Groups Tagging API results.
+
+    Args:
+        region: AWS region
+        account_id: AWS account ID
+
+    Returns:
+        List of Transit Gateway Attachment ARNs
+    """
+    ec2_client = boto3.client('ec2', region_name=region)
+
+    try:
+        paginator = ec2_client.get_paginator('describe_transit_gateway_attachments')
+        page_iterator = paginator.paginate()
+
+        arns = []
+        for page in page_iterator:
+            for attachment in page.get('TransitGatewayAttachments', []):
+                attachment_id = attachment['TransitGatewayAttachmentId']
+                # Build ARN: arn:aws:ec2:region:account-id:transit-gateway-attachment/tgw-attach-xxxxx
+                arn = f"arn:aws:ec2:{region}:{account_id}:transit-gateway-attachment/{attachment_id}"
+                arns.append(arn)
+
+        logging.info(f"Found {len(arns)} Transit Gateway Attachments in region {region}")
+        return arns
+
+    except Exception as e:
+        logging.error(f"Error fetching Transit Gateway Attachments in region {region}: {e}")
+        return []
 
 
 # ============================================================================
@@ -466,6 +517,27 @@ async def get_security_group_details(resource_arns: List[str], region: str) -> L
         return []
 
 
+async def get_transit_gateway_attachment_details(resource_arns: List[str], region: str) -> List[Dict[str, Any]]:
+    """Fetch details for Transit Gateway Attachments given their ARNs."""
+    if not resource_arns:
+        return []
+
+    ec2_client = boto3.client('ec2', region_name=region)
+    attachment_id_arn_map = {arn.split('/')[-1]: arn for arn in resource_arns}
+    attachment_ids = list(attachment_id_arn_map.keys())
+
+    try:
+        response = ec2_client.describe_transit_gateway_attachments(TransitGatewayAttachmentIds=attachment_ids)
+        attachments = []
+        for attachment in response['TransitGatewayAttachments']:
+            attachment['Arn'] = attachment_id_arn_map[attachment['TransitGatewayAttachmentId']]
+            attachments.append(attachment)
+        return attachments
+    except Exception as e:
+        logging.error(f"Error fetching Transit Gateway Attachment details: {e}")
+        return []
+
+
 async def get_rds_details(resource_arns: List[str], region: str) -> List[Dict[str, Any]]:
     """Fetch details for RDS Database Instances given their ARNs."""
     if not resource_arns:
@@ -606,6 +678,14 @@ async def sync_resource_type(
         else:
             resource_arns = await fetch_resources(resource_type, region)
         
+        # Handle resources that may be untagged (e.g., Transit Gateway Attachments)
+        if not resource_arns and config.get('fetch_all_if_untagged'):
+            fetch_all_fn_name = config.get('fetch_all_fn')
+            if fetch_all_fn_name:
+                logging.info(f"No tagged {resource_type} found in {region}, fetching all resources directly")
+                fetch_all_fn = globals()[fetch_all_fn_name]
+                resource_arns = await fetch_all_fn(region, account_id)
+
         if not resource_arns and config['fetch_fn'] not in ['list_iam_users', 'get_rds_details', 'get_lambda_details', 'get_dynamodb_details']:
             logging.debug(f"No {resource_type} resources found in region {region}")
             return 0
